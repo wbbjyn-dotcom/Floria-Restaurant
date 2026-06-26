@@ -1,0 +1,267 @@
+<?php
+/**
+ * سوبر جيم - نظام تسجيل الأعضاء
+ * Super Gym - Member Registration System
+ */
+
+header('Content-Type: application/json; charset=utf-8');
+header('Access-Control-Allow-Origin: *');
+header('Access-Control-Allow-Methods: POST, GET, OPTIONS');
+header('Access-Control-Allow-Headers: Content-Type');
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(200);
+    exit();
+}
+
+// =========================================
+// إعدادات قاعدة البيانات / Database Config
+// =========================================
+define('DB_HOST', 'localhost');
+define('DB_NAME', 'supergym_db');
+define('DB_USER', 'root');       // غيّر هذا
+define('DB_PASS', '');           // غيّر هذا
+define('DB_CHARSET', 'utf8mb4');
+
+// =========================================
+// الاتصال بقاعدة البيانات
+// =========================================
+function getDB() {
+    static $pdo = null;
+    if ($pdo === null) {
+        try {
+            $dsn = "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=" . DB_CHARSET;
+            $options = [
+                PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                PDO::ATTR_EMULATE_PREPARES   => false,
+            ];
+            $pdo = new PDO($dsn, DB_USER, DB_PASS, $options);
+        } catch (PDOException $e) {
+            respond(false, 'خطأ في الاتصال بقاعدة البيانات: ' . $e->getMessage(), null, 500);
+        }
+    }
+    return $pdo;
+}
+
+// =========================================
+// إنشاء الجداول إذا لم تكن موجودة
+// =========================================
+function createTablesIfNeeded() {
+    $db = getDB();
+
+    // جدول الأعضاء
+    $db->exec("CREATE TABLE IF NOT EXISTS members (
+        id          INT AUTO_INCREMENT PRIMARY KEY,
+        name        VARCHAR(200) NOT NULL COMMENT 'الاسم الرباعي',
+        phone       VARCHAR(20)  NOT NULL COMMENT 'رقم الجوال',
+        gender      ENUM('male','female') NOT NULL COMMENT 'الجنس',
+        join_date   DATE NOT NULL COMMENT 'تاريخ الانضمام',
+        expiry_date DATE NOT NULL COMMENT 'تاريخ انتهاء الاشتراك',
+        price       DECIMAL(10,2) NOT NULL DEFAULT 70.00 COMMENT 'سعر الاشتراك بالشيكل',
+        transfer_img VARCHAR(500) NULL COMMENT 'مسار صورة التحويل البنكي',
+        created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_name  (name),
+        INDEX idx_phone (phone),
+        INDEX idx_expiry (expiry_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
+}
+
+// =========================================
+// دالة الرد
+// =========================================
+function respond($success, $message, $data = null, $code = 200) {
+    http_response_code($code);
+    echo json_encode([
+        'success' => $success,
+        'message' => $message,
+        'data'    => $data,
+    ], JSON_UNESCAPED_UNICODE);
+    exit();
+}
+
+// =========================================
+// رفع صورة التحويل
+// =========================================
+function handleImageUpload() {
+    if (!isset($_FILES['transfer_img']) || $_FILES['transfer_img']['error'] !== UPLOAD_ERR_OK) {
+        return null;
+    }
+
+    $uploadDir = __DIR__ . '/uploads/transfers/';
+    if (!is_dir($uploadDir)) {
+        mkdir($uploadDir, 0755, true);
+    }
+
+    $allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+    $finfo = finfo_open(FILEINFO_MIME_TYPE);
+    $mime  = finfo_file($finfo, $_FILES['transfer_img']['tmp_name']);
+    finfo_close($finfo);
+
+    if (!in_array($mime, $allowed)) {
+        respond(false, 'نوع الملف غير مسموح — يُقبل JPG, PNG فقط');
+    }
+
+    if ($_FILES['transfer_img']['size'] > 5 * 1024 * 1024) {
+        respond(false, 'حجم الصورة يتجاوز 5 ميغابايت');
+    }
+
+    $ext      = pathinfo($_FILES['transfer_img']['name'], PATHINFO_EXTENSION);
+    $filename = 'transfer_' . time() . '_' . bin2hex(random_bytes(4)) . '.' . $ext;
+    $dest     = $uploadDir . $filename;
+
+    if (!move_uploaded_file($_FILES['transfer_img']['tmp_name'], $dest)) {
+        respond(false, 'فشل رفع الصورة — حاول مرة أخرى');
+    }
+
+    return 'uploads/transfers/' . $filename;
+}
+
+// =========================================
+// الوظائف الرئيسية
+// =========================================
+
+/** تسجيل عضو جديد */
+function registerMember() {
+    // التحقق من البيانات
+    $name   = trim($_POST['name']   ?? '');
+    $phone  = trim($_POST['phone']  ?? '');
+    $gender = trim($_POST['gender'] ?? '');
+
+    if (empty($name)) respond(false, 'الرجاء إدخال الاسم الرباعي');
+    if (count(array_filter(explode(' ', $name))) < 4) {
+        respond(false, 'يجب أن يكون الاسم رباعياً كاملاً (4 أسماء)');
+    }
+    if (empty($phone) || strlen($phone) < 9) respond(false, 'الرجاء إدخال رقم جوال صحيح');
+    if (!in_array($gender, ['male', 'female'])) respond(false, 'الرجاء تحديد الجنس');
+
+    // رفع صورة التحويل
+    $imgPath = handleImageUpload();
+    if ($imgPath === null) respond(false, 'الرجاء رفع صورة التحويل البنكي');
+
+    // =====================
+    // الاشتراك: شهر واحد — 70 شيكل
+    // =====================
+    $price     = 70.00;
+    $joinDate  = date('Y-m-d');
+    $expiryDate = date('Y-m-d', strtotime('+1 month'));
+
+    createTablesIfNeeded();
+    $db = getDB();
+
+    // التحقق من عدم التكرار
+    $checkStmt = $db->prepare("SELECT id FROM members WHERE name = ? AND expiry_date >= CURDATE()");
+    $checkStmt->execute([$name]);
+    if ($checkStmt->fetch()) {
+        respond(false, 'يوجد اشتراك فعّال بهذا الاسم — تحقق من بياناتك أو تواصل مع الإدارة');
+    }
+
+    // إدخال البيانات
+    $stmt = $db->prepare("
+        INSERT INTO members (name, phone, gender, join_date, expiry_date, price, transfer_img)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ");
+    $stmt->execute([$name, $phone, $gender, $joinDate, $expiryDate, $price, $imgPath]);
+    $memberId = $db->lastInsertId();
+
+    respond(true, 'تم التسجيل بنجاح', [
+        'id'          => (int)$memberId,
+        'name'        => $name,
+        'phone'       => $phone,
+        'gender'      => $gender,
+        'join_date'   => $joinDate,
+        'expiry_date' => $expiryDate,
+        'price'       => $price,
+        'currency'    => 'شيكل',
+        'duration'    => 'شهر واحد',
+    ]);
+}
+
+/** فحص اشتراك عضو */
+function checkMember() {
+    $name = trim($_GET['name'] ?? '');
+    if (empty($name)) respond(false, 'الرجاء إدخال الاسم');
+
+    createTablesIfNeeded();
+    $db = getDB();
+
+    $stmt = $db->prepare("
+        SELECT id, name, phone, gender, join_date, expiry_date, price, created_at
+        FROM members
+        WHERE name = ?
+        ORDER BY expiry_date DESC
+        LIMIT 1
+    ");
+    $stmt->execute([$name]);
+    $member = $stmt->fetch();
+
+    if (!$member) {
+        respond(false, 'لا يوجد اشتراك بهذا الاسم');
+    }
+
+    $today    = new DateTime();
+    $expiry   = new DateTime($member['expiry_date']);
+    $isActive = $expiry >= $today;
+    $daysLeft = (int)$today->diff($expiry)->days * ($isActive ? 1 : -1);
+
+    respond(true, $isActive ? 'اشتراك فعّال' : 'اشتراك منتهٍ', [
+        'id'          => (int)$member['id'],
+        'name'        => $member['name'],
+        'phone'       => $member['phone'],
+        'gender'      => $member['gender'],
+        'join_date'   => $member['join_date'],
+        'expiry_date' => $member['expiry_date'],
+        'is_active'   => $isActive,
+        'days_left'   => $isActive ? $daysLeft : 0,
+        'price'       => (float)$member['price'],
+        'duration'    => 'شهر واحد',
+        'currency'    => 'شيكل',
+    ]);
+}
+
+/** جلب جميع الأعضاء (لوحة الإدارة) */
+function getAllMembers() {
+    // حماية: تحقق من كلمة مرور بسيطة في الـ header
+    $adminKey = $_SERVER['HTTP_X_ADMIN_KEY'] ?? '';
+    if ($adminKey !== 'SUPERGYM_ADMIN_2024') {
+        respond(false, 'غير مصرح', null, 401);
+    }
+
+    createTablesIfNeeded();
+    $db = getDB();
+
+    $stmt = $db->query("
+        SELECT id, name, phone, gender, join_date, expiry_date, price,
+               CASE WHEN expiry_date >= CURDATE() THEN 'active' ELSE 'expired' END AS status,
+               DATEDIFF(expiry_date, CURDATE()) AS days_remaining
+        FROM members
+        ORDER BY created_at DESC
+    ");
+    $members = $stmt->fetchAll();
+
+    respond(true, 'تم جلب البيانات', [
+        'count'   => count($members),
+        'members' => $members,
+    ]);
+}
+
+// =========================================
+// التوجيه / Routing
+// =========================================
+$action = $_GET['action'] ?? '';
+
+switch ($_SERVER['REQUEST_METHOD']) {
+    case 'POST':
+        if ($action === 'register') registerMember();
+        respond(false, 'إجراء غير معروف', null, 400);
+        break;
+
+    case 'GET':
+        if ($action === 'check')   checkMember();
+        if ($action === 'members') getAllMembers();
+        respond(false, 'إجراء غير معروف', null, 400);
+        break;
+
+    default:
+        respond(false, 'طريقة الطلب غير مدعومة', null, 405);
+}
